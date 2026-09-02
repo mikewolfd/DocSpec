@@ -1115,9 +1115,15 @@ class RegulationsGovCatalogPolicy:
             candidates=offers,
             budget_available=budget_available,
         )
-        source_issued_version = attributes.get("modifyDate")
-        if not isinstance(source_issued_version, str) or not source_issued_version:
-            raise IntegrityError("Regulations.gov docket has no source-issued version")
+        # A missing modifyDate leaves required `lastUpdatedDate` absent, so
+        # `selection` above is never SELECTED and the placeholder never reaches
+        # a served item; the same fallback the document row applies.
+        raw_issued_version = attributes.get("modifyDate")
+        source_issued_version = (
+            raw_issued_version
+            if isinstance(raw_issued_version, str) and raw_issued_version
+            else "unknown"
+        )
         sampling_result = {
             "frameAdmitted": True,
             "partition": "all",
@@ -1723,9 +1729,16 @@ class RegulationsGovCatalogPolicy:
                 },
             },
         )
-        source_issued_version = attributes.get("modifyDate") or attributes.get("postedDate")
-        if not isinstance(source_issued_version, str) or not source_issued_version:
-            raise IntegrityError("Regulations.gov document has no source-issued version")
+        # Neither date leaves required `publicationDate` absent, so `selection`
+        # above is already DELETED, EXCLUDED, or FAILED: the placeholder never
+        # reaches a SELECTED item, and one bad row cannot abort a long build.
+        # `FederalRegisterCatalogPolicy` uses the same `"unknown"` fallback.
+        raw_issued_version = attributes.get("modifyDate") or attributes.get("postedDate")
+        source_issued_version = (
+            raw_issued_version
+            if isinstance(raw_issued_version, str) and raw_issued_version
+            else "unknown"
+        )
         return SourceCatalogItem(
             source_item_id=source_item_id,
             document_id=source_item_id,

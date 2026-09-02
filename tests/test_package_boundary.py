@@ -37,6 +37,9 @@ SIBLING_CHECKOUT_PATH = re.compile(r"(?:^|/)spicy[-_]regs(?:/|\Z)")
 SIBLING_MODULE_PATH = re.compile(r"\bspicy_regs\.")
 SIBLING_PACKAGE_ROOTS = frozenset({"spicy_regs", "spicyregs"})
 OPTIONAL_SOURCE_ADAPTER = "src/docspec/adapters/spicyregs_source_native.py"
+# The adapter's own test names the fallback reader module as test data: it
+# injects a fake under that name to prove resolution order and refusal.
+OPTIONAL_SOURCE_ADAPTER_TEST = "tests/test_spicyregs_source_native.py"
 PINNED_INSTALLED_SOURCE_PROBE = "tests/test_source_catalog_installed_wheel.py"
 OPTIONAL_SOURCE_MODULES = frozenset(
     {
@@ -47,6 +50,9 @@ OPTIONAL_SOURCE_MODULES = frozenset(
 OPTIONAL_SOURCE_COMPOSITION_ROOTS = frozenset(
     {"src/docspec/cli.py", "src/docspec/source_catalog_cli.py"}
 )
+# This module names a URN namespace reserved for a registry DocSpec does not
+# own. It is data the catalog refuses to mint, not an import of that product.
+RESERVED_NAMESPACE_ROOTS = frozenset({"src/docspec/application/catalog_policy.py"})
 # An absolute path whose first segment is a home-directory root belongs to one
 # developer's machine, so it can only reach code this repository does not own.
 HOME_DIRECTORY_ROOTS = frozenset({"Users", "home"})
@@ -150,7 +156,7 @@ def test_no_repository_code_names_a_sibling_checkout_or_an_outside_working_direc
                     violations.append(f"{relative}:{node.lineno} names a SpicyRegs path: {value!r}")
                 if SIBLING_MODULE_PATH.search(value) and not (
                     (
-                        relative == OPTIONAL_SOURCE_ADAPTER
+                        relative in (OPTIONAL_SOURCE_ADAPTER, OPTIONAL_SOURCE_ADAPTER_TEST)
                         and value in OPTIONAL_SOURCE_MODULES
                     )
                     or relative == PINNED_INSTALLED_SOURCE_PROBE
@@ -316,6 +322,8 @@ def test_non_docspec_product_areas_are_absent_from_production() -> None:
         source = path.read_text(encoding="utf-8").casefold()
         for word in ADAPTER_ONLY_SIBLING_PACKAGES:
             if relative in OPTIONAL_SOURCE_COMPOSITION_ROOTS and word == "spicyregs":
+                continue
+            if relative in RESERVED_NAMESPACE_ROOTS and word == "refspec":
                 continue
             if re.search(rf"\b{re.escape(word.casefold())}\b", source):
                 violations.append(f"{path.relative_to(ROOT)} names {word}")

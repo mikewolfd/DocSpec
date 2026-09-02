@@ -546,7 +546,14 @@ duplicates. The nested forms are:
   declares every source
   column in its pinned closed schema; a new or unclassified input column fails
   the build instead of disappearing. `fields` preserves the source value and
-  null exactly.
+  null exactly. A regulations.gov document item's `sourceNativeFacts` include
+  its matched docket's exact record under schema name
+  `regulations-gov-docket-raw` — the source SpicySearch's
+  `fields/data/attributes/dkAbstract` pointer resolves against — only when
+  that docket exists in the catalog's docket universe. A docket miss does not
+  by itself change the document's disposition; the item records the
+  `document-docket` join outcome `no-match`, and the build receipt counts it in
+  `joinCoverage`.
 - `normalizedMetadata`: one closed object containing `title`, `agencies`,
   `documentType`, `publicationDate`, `lastUpdatedDate`, `docketIds`,
   `regulationIdentifierNumbers`, `commentCloseDate`, `language`, and

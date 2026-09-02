@@ -1671,13 +1671,16 @@ def install_fake_source_native(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fake_profile = object()
 
-    package_name = "spicy_" + "regs"
+    # Shadow the producer package the adapter resolves first, so these tests
+    # exercise the fake reader whether or not a real one is installed.
+    package_name = "spicy_docs"
     module_name = package_name + ".source_native"
     profiles_module_name = package_name + ".source_native_profiles"
     package = ModuleType(package_name)
     package.__path__ = []  # type: ignore[attr-defined]
     module = ModuleType(module_name)
     profiles_module = ModuleType(profiles_module_name)
+    module.SUPPORTED_PRODUCER_PRODUCTS = frozenset({"spicy-regs", "spicy-docs"})  # type: ignore[attr-defined]
     module.SourceNativeReleaseReader = FakeReader  # type: ignore[attr-defined]
     profiles_module.FEDERAL_REGISTER_PROFILE = fake_profile  # type: ignore[attr-defined]
     profiles_module.REGULATIONS_GOV_DOCUMENT_PROFILE = object()  # type: ignore[attr-defined]
@@ -1733,12 +1736,15 @@ def test_spicyregs_adapter_pins_the_source_blob_root_across_streams(
         def iter_renditions(self):
             return iter(())
 
-    module_name = "spicy_" + "regs.source_native"
+    module_name = "spicy_docs.source_native"
     source_native = ModuleType(module_name)
+    source_native.SUPPORTED_PRODUCER_PRODUCTS = frozenset({"spicy-regs", "spicy-docs"})  # type: ignore[attr-defined]
     source_native.SourceNativeReleaseReader = FakeReader  # type: ignore[attr-defined]
     monkeypatch.setattr(
         "docspec.adapters.spicyregs_source_native.import_module",
-        lambda name: source_native if name == module_name else (_ for _ in ()).throw(ModuleNotFoundError(name)),
+        lambda name: source_native
+        if name == module_name
+        else (_ for _ in ()).throw(ModuleNotFoundError(name, name=name)),
     )
     adapter = SpicyRegsSourceNativeAdapter.from_local(
         source_root,

@@ -137,6 +137,11 @@ def normalization_field(
     )
 
 
+#: URN prefixes reserved for a concept registry this repository does not own,
+#: so a publisher's raw vocabulary can never mint an id that registry owns (D6).
+_RESERVED_TOPIC_NAMESPACES = ("urn:ref:", "urn:refspec:")
+
+
 def observed_topics(
     value: object,
     *,
@@ -144,6 +149,8 @@ def observed_topics(
     identity_fields: tuple[str, ...],
     label_fields: tuple[str, ...],
 ) -> tuple[dict[str, str], ...]:
+    if scheme.startswith(_RESERVED_TOPIC_NAMESPACES):
+        raise IntegrityError(f"observed topic scheme {scheme!r} claims a reserved concept namespace")
     result: dict[tuple[str, str], dict[str, str]] = {}
     values = value if isinstance(value, list) else []
     for raw in values:
@@ -170,6 +177,8 @@ def observed_topics(
                 continue
         else:
             continue
+        if identity.startswith(_RESERVED_TOPIC_NAMESPACES):
+            raise IntegrityError(f"observed topic id {identity!r} claims a reserved concept namespace")
         result[(identity, label)] = {
             "observedTopicId": identity,
             "observedTopicScheme": scheme,
