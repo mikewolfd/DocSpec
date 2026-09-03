@@ -76,6 +76,9 @@ def closed_mapping(
 
 _TRUSTED_JSON_INPUT = contextvars.ContextVar("docspec_trusted_json_input", default=False)
 
+#: The exact types canonical JSON decoding produces; see _canonical_plain_checked.
+_PLAIN_JSON_TYPES = (dict, list, str, int, bool, type(None))
+
 
 @contextlib.contextmanager
 def trusted_json_input() -> Iterator[None]:
@@ -106,12 +109,41 @@ def _wrap_trusted(value: Any) -> JSONValue:
 def freeze_json(value: Any, *, label: str = "value") -> JSONValue:
     """Return an immutable JSON value and reject ambiguous inputs."""
 
-    if _TRUSTED_JSON_INPUT.get() and type(value) in (dict, list, str, int, bool, type(None)):
+    if _TRUSTED_JSON_INPUT.get() and type(value) in _PLAIN_JSON_TYPES:
         return _wrap_trusted(value)
+    return _freeze_checked(value, label)
+
+
+def _freeze_checked(value: Any, label: str) -> JSONValue:
+    """Freeze one value, dispatching on exact type before anything abstract.
+
+    Same ordering argument as :func:`_canonical_plain_checked`: dict, str, int
+    and list are almost every value in a record, and reaching them through
+    ``is_dataclass``, ``Enum`` and the ``Mapping``/``Sequence`` abstract base
+    classes made each one pay for checks that do not match. A profiled build
+    put this function at 11.1M calls and 11.3 s of self time.
+
+    Anything the fast path does not recognise falls through to the original
+    checks, in the original order, with the original refusals.
+    """
+
+    kind = type(value)
+    if kind is str or kind is int or kind is bool or value is None:
+        return value
+    if kind is dict:
+        frozen: dict[str, JSONValue] = {}
+        for key, item in value.items():
+            if type(key) is not str and not isinstance(key, str):
+                raise ValueError(f"{label} contains a non-string object key")
+            frozen[key] = _freeze_checked(item, f"{label}.{key}")
+        return MappingProxyType(dict(sorted(frozen.items())))
+    if kind is list:
+        return tuple(_freeze_checked(item, f"{label}[]") for item in value)
+
     if is_dataclass(value) and not isinstance(value, type):
-        value = asdict(value)
+        return _freeze_checked(asdict(value), label)
     if isinstance(value, Enum):
-        return freeze_json(value.value, label=label)
+        return _freeze_checked(value.value, label)
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -121,16 +153,16 @@ def freeze_json(value: Any, *, label: str = "value") -> JSONValue:
             raise ValueError(f"{label} contains a non-finite number")
         raise ValueError(f"{label} contains a floating-point number; use an integer unit or decimal string")
     if isinstance(value, Mapping):
-        frozen: dict[str, JSONValue] = {}
+        mapped: dict[str, JSONValue] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{label} contains a non-string object key")
-            if key in frozen:
+            if key in mapped:
                 raise ValueError(f"{label} contains a duplicate key: {key}")
-            frozen[key] = freeze_json(item, label=f"{label}.{key}")
-        return MappingProxyType(dict(sorted(frozen.items())))
+            mapped[key] = _freeze_checked(item, f"{label}.{key}")
+        return MappingProxyType(dict(sorted(mapped.items())))
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
-        return tuple(freeze_json(item, label=f"{label}[]") for item in value)
+        return tuple(_freeze_checked(item, f"{label}[]") for item in value)
     raise ValueError(f"{label} contains unsupported type {type(value).__name__}")
 
 
@@ -162,14 +194,50 @@ def _canonical_plain(value: Any, *, label: str = "value") -> Any:
     cannot move a byte.
     """
 
-    if _TRUSTED_JSON_INPUT.get() and type(value) in (dict, list, str, int, bool, type(None)):
+    if _TRUSTED_JSON_INPUT.get() and type(value) in _PLAIN_JSON_TYPES:
         # Canonical parsing already established string keys, no duplicates, no
         # floats and canonical order. Nothing is left to check or to copy.
         return value
+    return _canonical_plain_checked(value, label)
+
+
+def _canonical_plain_checked(value: Any, label: str) -> Any:
+    """Walk one value, dispatching on exact type before anything abstract.
+
+    Records are overwhelmingly str, dict, int and list. Reaching those through
+    ``is_dataclass`` (a ``hasattr``), an ``Enum`` check and finally ``Mapping``
+    and ``Sequence`` -- which are abstract base classes, so every test routes
+    through ``abc.__instancecheck__`` -- made each value pay for six checks
+    that do not match before the one that does. A profiled 40-release build
+    spent 10.6 s in ``is_dataclass`` over 31.7M calls, 4.7 s in ABC dispatch
+    over 20.3M, and 2.4 s reading a ContextVar per value; ``isinstance`` was
+    188.8M calls and 15.6 s.
+
+    Exact ``type(...) is`` tests come first, so those paths cost one pointer
+    comparison each. Everything the fast path does not recognise -- dataclasses,
+    Enums, str subclasses, tuples, custom Mappings -- falls through to the
+    original checks, in the original order, with the original refusals. The
+    ContextVar is read once by the caller rather than at every level.
+    """
+
+    kind = type(value)
+    if kind is str or kind is int or kind is bool or value is None:
+        return value
+    if kind is dict:
+        plain: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str and not isinstance(key, str):
+                raise ValueError(f"{label} contains a non-string object key")
+            plain[key] = _canonical_plain_checked(item, f"{label}.{key}")
+        return plain
+    if kind is list:
+        return [_canonical_plain_checked(item, f"{label}[]") for item in value]
+
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
+        return _canonical_plain_checked(value, label)
     if isinstance(value, Enum):
-        return _canonical_plain(value.value, label=label)
+        return _canonical_plain_checked(value.value, label)
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -179,16 +247,16 @@ def _canonical_plain(value: Any, *, label: str = "value") -> Any:
             raise ValueError(f"{label} contains a non-finite number")
         raise ValueError(f"{label} contains a floating-point number; use an integer unit or decimal string")
     if isinstance(value, Mapping):
-        plain: dict[str, Any] = {}
+        mapped: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{label} contains a non-string object key")
-            if key in plain:
+            if key in mapped:
                 raise ValueError(f"{label} contains a duplicate key: {key}")
-            plain[key] = _canonical_plain(item, label=f"{label}.{key}")
-        return plain
+            mapped[key] = _canonical_plain_checked(item, f"{label}.{key}")
+        return mapped
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
-        return [_canonical_plain(item, label=f"{label}[]") for item in value]
+        return [_canonical_plain_checked(item, f"{label}[]") for item in value]
     raise ValueError(f"{label} contains unsupported type {type(value).__name__}")
 
 
