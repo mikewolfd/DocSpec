@@ -55,6 +55,7 @@ from docspec.ports.source_catalog import (
     SourceNativeDescription,
 )
 from docspec.entrypoint import main
+from tests.helpers import CountItems, KillAfter
 
 _SHA_A = "sha256:" + "a" * 64
 _SHA_B = "sha256:" + "b" * 64
@@ -3016,3 +3017,95 @@ def test_receipt_reason_counts_must_be_ordered_distinct_and_reconciled() -> None
         reconcile(good[:2], counts)
     with pytest.raises(IntegrityError, match="do not account for every non-selected row"):
         reconcile(good, {**counts, "excluded": 1})
+
+
+def test_a_build_resumed_from_a_killed_workspace_publishes_the_identical_artifact(
+    tmp_path: Path,
+) -> None:
+    """The acceptance rule for resume, written before the feature existed.
+
+    A build that dies mid-stream and is resumed from its committed workspace
+    publishes byte-for-byte the artifact a fresh build publishes, computes only
+    the items after its last commit, and a workspace staged under another build
+    identity is refused rather than reused. Two catalog-A builds died this way
+    at 23 and 27.7 minutes with nothing readable left behind.
+    """
+
+    identities = tuple(f"2026-{index:05d}" for index in range(1, 8))
+
+    def source() -> FakeSource:
+        return FakeSource(
+            description(),
+            tuple(record(identity) for identity in identities),
+            tuple(value for identity in identities for value in renditions(identity)),
+        )
+
+    def builder(
+        root: Path,
+        policy: object,
+        workspace_factory: Any,
+        *,
+        build_producer: Producer | None = None,
+    ) -> SourceCatalogBuilder:
+        return SourceCatalogBuilder(
+            store=LocalSourceCatalogStore(root),
+            policy=policy,  # type: ignore[arg-type]
+            request=SourceCatalogBuildRequest(
+                "urn:docspec:catalog:federal-register", build_producer or producer()
+            ),
+            workspace_factory=workspace_factory,
+            resume_batch_items=2,
+        )
+
+    def receipt_bytes(root: Path, reference: SourceCatalogRef) -> bytes:
+        return (root / reference.digest.removeprefix("sha256:") / "catalog-build-receipt.json").read_bytes()
+
+    fresh_root = tmp_path / "fresh"
+    fresh = builder(
+        fresh_root, FederalRegisterCatalogPolicy(_FEDERAL_REGISTER_SOURCE), SqliteCatalogPolicyWorkspace
+    ).build((source(),))
+
+    workspace_path = tmp_path / "resume" / "workspace.sqlite3"
+
+    def durable() -> SqliteCatalogPolicyWorkspace:
+        return SqliteCatalogPolicyWorkspace(path=workspace_path)
+
+    resumed_root = tmp_path / "resumed"
+    killed = KillAfter(FederalRegisterCatalogPolicy(_FEDERAL_REGISTER_SOURCE), yields=5)
+    with pytest.raises(IntegrityError, match="injected kill mid-stream"):
+        builder(resumed_root, killed, durable).build((source(),))
+    assert killed.computed == 5
+    assert workspace_path.exists()
+
+    counted = CountItems(FederalRegisterCatalogPolicy(_FEDERAL_REGISTER_SOURCE))
+    resumed = builder(resumed_root, counted, durable).build((source(),))
+
+    assert resumed.reference == fresh.reference
+    # Items 1-4 were committed in two batches of two; item 5 was staged in a
+    # batch the kill rolled back, so the resumed run recomputes 5, 6 and 7.
+    assert counted.computed == 3
+    assert receipt_bytes(resumed_root, resumed.reference) == receipt_bytes(fresh_root, fresh.reference)
+
+    other_path = tmp_path / "other" / "workspace.sqlite3"
+    other_root = tmp_path / "other-store"
+    with pytest.raises(IntegrityError, match="injected kill mid-stream"):
+        builder(
+            other_root,
+            KillAfter(FederalRegisterCatalogPolicy(_FEDERAL_REGISTER_SOURCE), yields=5),
+            lambda: SqliteCatalogPolicyWorkspace(path=other_path),
+        ).build((source(),))
+    other_implementation = "git+https://example.test/docspec@" + "2" * 40
+    other_producer = Producer(
+        "docspec",
+        other_implementation,
+        "urn:docspec:verifier:source-catalog",
+        "1.0.0",
+        other_implementation,
+    )
+    with pytest.raises(IntegrityError, match="staged by a different build"):
+        builder(
+            other_root,
+            FederalRegisterCatalogPolicy(_FEDERAL_REGISTER_SOURCE),
+            lambda: SqliteCatalogPolicyWorkspace(path=other_path),
+            build_producer=other_producer,
+        ).build((source(),))

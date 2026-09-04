@@ -105,8 +105,31 @@ class SourceNativeRow:
     discarded_filings: tuple[Mapping[str, Any], ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogResumePoint:
+    """Where a resumed build picks up, as the policy needs to know it.
+
+    ``indexed`` says the policy's own pre-pass (indexes, staged universe,
+    sample draw) is already in the workspace and must not run again; ``after``
+    is the last committed sourceItemId, and the builder's ordered universe
+    reads already start past it; ``selected_count`` carries the count a
+    selected-item budget had reached. A fresh build is ``FRESH_BUILD``.
+    """
+
+    indexed: bool
+    after: str | None
+    selected_count: int
+
+
+FRESH_BUILD = CatalogResumePoint(indexed=False, after=None, selected_count=0)
+
+
 class CatalogPolicyWorkspace(Protocol):
-    """Bounded ephemeral exact-key and ordered-row storage for one policy run."""
+    """Bounded exact-key and ordered-row storage for one policy run.
+
+    Ephemeral by default; a durable implementation may also ``commit`` so a
+    killed build leaves what it had committed for a resumed one to read.
+    """
 
     def put(
         self,
@@ -132,7 +155,15 @@ class CatalogPolicyWorkspace(Protocol):
         """
         ...
 
-    def iter_ordered(self, namespace: str) -> Iterator[Mapping[str, Any]]: ...
+    def iter_ordered(
+        self, namespace: str, *, after: tuple[str, ...] | None = None
+    ) -> Iterator[Mapping[str, Any]]: ...
+
+    def commit(self) -> None:
+        """Make everything written so far survive the process. Optional: a
+        workspace that cannot resume may leave this unimplemented and the
+        builder records no resume points."""
+        ...
 
 
 class CatalogPolicyInputs(Protocol):
@@ -158,6 +189,12 @@ class CatalogPolicyInputs(Protocol):
 
     @property
     def descriptions(self) -> tuple[SourceNativeDescription, ...]: ...
+
+    @property
+    def resume(self) -> CatalogResumePoint:
+        """Where this run picks up. ``FRESH_BUILD`` unless the builder found a
+        committed workspace staged under this build's own identity."""
+        ...
 
     def iter_universe_rows(self) -> Iterator[SourceNativeRow]: ...
 

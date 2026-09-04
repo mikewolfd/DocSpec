@@ -50,13 +50,28 @@ def _mapping(payload: bytes, *, label: str) -> Mapping[str, Any]:
 class SqliteCatalogPolicyWorkspace:
     """Store policy indexes and ordered frames without corpus-sized memory."""
 
-    def __init__(self, *, directory: Path | None = None) -> None:
-        parent = str(Path(directory)) if directory is not None else None
-        self._temporary = tempfile.TemporaryDirectory(
-            prefix="docspec-catalog-policy-",
-            dir=parent,
-        )
-        self._connection = sqlite3.connect(Path(self._temporary.name) / "workspace.sqlite3")
+    def __init__(self, *, directory: Path | None = None, path: Path | None = None) -> None:
+        """Open a disposable workspace, or a durable one at ``path``.
+
+        Without ``path`` the workspace is a temporary directory removed on
+        close, as before. With ``path`` the file outlives the process: a build
+        that dies leaves everything it committed, and the next build with the
+        same identity resumes from it (see ``_ResumeLedger``). Nothing here is
+        digested either way; the artifact is built from what the table yields.
+        """
+
+        if path is not None:
+            self._temporary = None
+            database = Path(path)
+            database.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            parent = str(Path(directory)) if directory is not None else None
+            self._temporary = tempfile.TemporaryDirectory(
+                prefix="docspec-catalog-policy-",
+                dir=parent,
+            )
+            database = Path(self._temporary.name) / "workspace.sqlite3"
+        self._connection = sqlite3.connect(database)
         # Set before CREATE TABLE, which is the only point it can be set: SQLite
         # fixes the page size when the first table is written.
         #
@@ -75,7 +90,7 @@ class SqliteCatalogPolicyWorkspace:
         self._connection.execute("PRAGMA synchronous=OFF")
         self._connection.execute(
             """
-            CREATE TABLE entries (
+            CREATE TABLE IF NOT EXISTS entries (
                 namespace TEXT NOT NULL,
                 ordered_key BLOB NOT NULL,
                 payload BLOB NOT NULL,
@@ -96,7 +111,18 @@ class SqliteCatalogPolicyWorkspace:
             return
         self._connection = None
         connection.close()
-        self._temporary.cleanup()
+        if self._temporary is not None:
+            self._temporary.cleanup()
+
+    def commit(self) -> None:
+        """Make everything written so far survive a kill.
+
+        Cheap under ``synchronous=OFF``: no fsync, only the journal reset. The
+        builder calls this at each resume point; what a resumed build sees is
+        exactly the last commit, because SQLite rolls back the rest on open.
+        """
+
+        self._connection.commit()
 
     def put(
         self,
@@ -168,12 +194,21 @@ class SqliteCatalogPolicyWorkspace:
             return None
         return _mapping(row[0], label=f"catalog workspace {selected_namespace} value")
 
-    def iter_ordered(self, namespace: str) -> Iterator[Mapping[str, Any]]:
+    def iter_ordered(
+        self, namespace: str, *, after: tuple[str, ...] | None = None
+    ) -> Iterator[Mapping[str, Any]]:
         selected_namespace = require_text(namespace, "catalog workspace namespace")
-        cursor = self._connection.execute(
-            "SELECT payload FROM entries WHERE namespace = ? ORDER BY ordered_key",
-            (selected_namespace,),
-        )
+        if after is None:
+            cursor = self._connection.execute(
+                "SELECT payload FROM entries WHERE namespace = ? ORDER BY ordered_key",
+                (selected_namespace,),
+            )
+        else:
+            cursor = self._connection.execute(
+                "SELECT payload FROM entries WHERE namespace = ? AND ordered_key > ?"
+                " ORDER BY ordered_key",
+                (selected_namespace, _ordered_key(after)),
+            )
         for (payload,) in cursor:
             yield _mapping(payload, label=f"catalog workspace {selected_namespace} value")
 

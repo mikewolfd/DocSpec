@@ -631,10 +631,16 @@ def _build(args: argparse.Namespace) -> int:
             store=catalog_store,
             policy=policy,
             request=SourceCatalogBuildRequest(catalog_id, producer),
-            workspace_factory=lambda: SqliteCatalogPolicyWorkspace(
-                directory=publication.root
+            workspace_factory=lambda: (
+                SqliteCatalogPolicyWorkspace(path=args.resume_workspace)
+                if args.resume_workspace is not None
+                else SqliteCatalogPolicyWorkspace(directory=publication.root)
             ),
         ).build(sources)
+        if args.resume_workspace is not None:
+            # Published, so the workspace is now tens of gigabytes of nothing.
+            for suffix in ("", "-journal"):
+                Path(f"{args.resume_workspace}{suffix}").unlink(missing_ok=True)
         publication.remove_empty_directory(".staging")
         content = {
             "operation": "source-catalog.build",
@@ -712,6 +718,17 @@ def _add_subcommands(source_catalog: argparse.ArgumentParser) -> None:
     source_build.add_argument("--implementation-id", required=True)
     source_build.add_argument("--verifier-implementation-id", required=True)
     source_build.add_argument("--destination", type=Path, required=True)
+    source_build.add_argument(
+        "--resume-workspace",
+        type=Path,
+        default=None,
+        help=(
+            "Keep the build workspace at this path and commit it as the build"
+            " progresses. A build that dies leaves it behind; running the same"
+            " command again resumes from the last commit and publishes the"
+            " identical artifact. Removed after a successful publish."
+        ),
+    )
     source_build.add_argument(
         "--receipt",
         type=Path,

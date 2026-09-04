@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from types import SimpleNamespace
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ from docspec.domain.source_catalog import CatalogDisposition, SourceCatalogItem
 from docspec.errors import IntegrityError
 from docspec.ports.source_catalog import SourceInputSelector, SourceNativeDescription
 from docspec.source_catalog_cli import build_parser as source_catalog_build_parser
+from tests.helpers import CountItems, KillAfter
 
 _DOCUMENT_SYSTEM = "urn:test:regulations-gov:documents"
 _DOCKET_SYSTEM = "urn:test:regulations-gov:dockets"
@@ -367,16 +368,32 @@ def _build_items(
             federal_register_renditions,
         )
     )
-    store = LocalSourceCatalogStore(root)
-    result = SourceCatalogBuilder(
-        store=store,
-        policy=selected_policy,
+    result = _build_result(root, sources, selected_policy)
+    return _items(root, result.reference)
+
+
+def _build_result(
+    root: Path,
+    sources: Sequence[_Source],
+    policy: object,
+    *,
+    workspace_factory: Any = SqliteCatalogPolicyWorkspace,
+    resume_batch_items: int | None = None,
+) -> Any:
+    options = {} if resume_batch_items is None else {"resume_batch_items": resume_batch_items}
+    return SourceCatalogBuilder(
+        store=LocalSourceCatalogStore(root),
+        policy=policy,  # type: ignore[arg-type]
         request=SourceCatalogBuildRequest("urn:test:catalog:regulations-gov", _producer()),
-        workspace_factory=SqliteCatalogPolicyWorkspace,
+        workspace_factory=workspace_factory,
+        **options,
     ).build(tuple(sources))
-    snapshot = SourceCatalogArtifactReader(store, producer=_producer()).open_snapshot(
-        result.reference
-    )
+
+
+def _items(root: Path, reference: Any) -> tuple[SourceCatalogItem, ...]:
+    snapshot = SourceCatalogArtifactReader(
+        LocalSourceCatalogStore(root), producer=_producer()
+    ).open_snapshot(reference)
     return tuple(snapshot.items)
 
 
@@ -1364,3 +1381,69 @@ def test_receipt_reason_counts_reconcile_to_every_non_selected_bucket(
         {"disposition": "unavailable", "reasonCode": "source.publisher-withheld.copyrighted", "count": 2},
         {"disposition": "unavailable", "reasonCode": "source.publisher-withheld.other", "count": 1},
     ]
+
+
+def test_resume_carries_the_selected_item_budget_across_the_kill(tmp_path: Path) -> None:
+    """A resumed Regulations.gov build skips the indexing phase it already
+    committed, restarts the item stream after its last committed batch, and
+    carries the selected-item count forward, so a budget exhausted before the
+    kill stays exhausted after it. Losing that count would select two more
+    comments and publish a different catalog under the same inputs.
+    """
+
+    base = _policy(include_comments=True)
+
+    def policy() -> RegulationsGovCatalogPolicy:
+        return RegulationsGovCatalogPolicy(
+            document_input=base.document_input,
+            docket_input=base.docket_input,
+            federal_register_input=base.federal_register_input,
+            agency_names=base.agency_names,
+            max_selected_items=2,
+            comment_input=base.comment_input,
+        )
+
+    def sources() -> list[_Source]:
+        return [
+            _Source(_description("documents", _DOCUMENT_SYSTEM, _REGULATIONS_VERSION), (), ()),
+            _Source(_description("dockets", _DOCKET_SYSTEM, _REGULATIONS_VERSION), ()),
+            _Source(
+                _description("comments", _COMMENT_SYSTEM, _REGULATIONS_VERSION),
+                tuple(_comment(f"EPA-2026-0001-92{index:02d}") for index in range(1, 6)),
+                (),
+            ),
+            _Source(
+                _description(
+                    "federal-register", _FEDERAL_REGISTER_SYSTEM, "v1", state_scope="observed-crawl"
+                ),
+                (),
+                (),
+            ),
+        ]
+
+    fresh = _build_result(tmp_path / "fresh", sources(), policy())
+    assert [item.disposition for item in _items(tmp_path / "fresh", fresh.reference)] == [
+        CatalogDisposition.SELECTED,
+        CatalogDisposition.SELECTED,
+        CatalogDisposition.EXCLUDED,
+        CatalogDisposition.EXCLUDED,
+        CatalogDisposition.EXCLUDED,
+    ]
+
+    workspace_path = tmp_path / "workspace.sqlite3"
+
+    def durable() -> SqliteCatalogPolicyWorkspace:
+        return SqliteCatalogPolicyWorkspace(path=workspace_path)
+
+    killed = KillAfter(policy(), yields=3)
+    with pytest.raises(IntegrityError, match="injected kill mid-stream"):
+        _build_result(
+            tmp_path / "resumed", sources(), killed, workspace_factory=durable, resume_batch_items=2
+        )
+    counted = CountItems(policy())
+    resumed = _build_result(
+        tmp_path / "resumed", sources(), counted, workspace_factory=durable, resume_batch_items=2
+    )
+
+    assert counted.computed == 3
+    assert resumed.reference == fresh.reference

@@ -32,6 +32,7 @@ from docspec.errors import IntegrityError
 from docspec.ports.source_catalog import (
     CatalogPolicyInputs,
     CatalogPolicyWorkspace,
+    FRESH_BUILD,
     SourceInputSelector,
     SourceRecordCollisionResolution,
 )
@@ -901,11 +902,15 @@ class RegulationsGovCatalogPolicy:
         inputs: CatalogPolicyInputs,
         workspace: CatalogPolicyWorkspace,
     ) -> Iterator[SourceCatalogItem]:
-        _index_rows(inputs, workspace, self.federal_register_input, _FEDERAL_REGISTER_INDEX)
-        self._stage_universe(inputs, workspace)
-        selected_count = 0
-        if self.sample is not None:
-            self._draw_document_sample(workspace)
+        resume = getattr(inputs, "resume", FRESH_BUILD)
+        if not resume.indexed:
+            _index_rows(inputs, workspace, self.federal_register_input, _FEDERAL_REGISTER_INDEX)
+            self._stage_universe(inputs, workspace)
+            if self.sample is not None:
+                self._draw_document_sample(workspace)
+        # A resumed run starts past its last committed item with the budget
+        # it had reached; forgetting either would publish a different catalog.
+        selected_count = resume.selected_count
         for row in inputs.iter_universe_rows():
             record = row.record
             renditions = row.renditions

@@ -63,15 +63,17 @@ from docspec.errors import IntegrityError, LimitExceededError
 from docspec.ports.source_catalog import (
     CatalogPolicyInputs,
     CatalogPolicyWorkspace,
+    CatalogResumePoint,
+    FRESH_BUILD,
     ImmutableSourceCatalogReader,
     LocatedSourceCatalogItem,
-    SourceInputSelector,
-    SourceCatalogPolicy,
     SourceCatalogBlobSource,
+    SourceCatalogPolicy,
     SourceCatalogSnapshot,
     SourceCatalogSnapshotSummary,
-    SourceCatalogSuccession,
     SourceCatalogStore,
+    SourceCatalogSuccession,
+    SourceInputSelector,
     SourceNativeDescription,
     SourceNativeRecordSource,
     SourceNativeRow,
@@ -677,6 +679,89 @@ def _source_rows(source: SourceNativeRecordSource) -> Iterator[tuple[Mapping[str
         raise IntegrityError("source-native rendition has no matching record")
 
 
+_RESUME_NAMESPACE = "source-catalog/resume"
+
+
+class _ResumeLedger:
+    """Every resume point of one build, kept in the workspace it describes.
+
+    A durable workspace outlives a killed process, and SQLite discards whatever
+    followed the last commit when it is next opened, so this ledger is the whole
+    of what a resumed build may trust: the identity the workspace was staged
+    under (``open`` refuses any other), which inputs finished loading, whether
+    the policy's pre-pass finished, and the last committed batch of staged
+    items with the counts the receipt will need. Every mark commits, so the
+    ledger never claims more than the file holds.
+
+    A workspace with no ``commit`` cannot survive a kill; its ledger records
+    nothing and reports a fresh build, so the temporary-workspace path is the
+    build it always was.
+    """
+
+    def __init__(self, workspace: CatalogPolicyWorkspace) -> None:
+        self._workspace = workspace
+        self._commit = getattr(workspace, "commit", None)
+        self.point = FRESH_BUILD
+        self.cursor_state: Mapping[str, Any] | None = None
+        self.staged_state: Mapping[str, Any] | None = None
+
+    def _get(self, key: tuple[str, ...]) -> Mapping[str, Any] | None:
+        return self._workspace.get(_RESUME_NAMESPACE, key)
+
+    def _mark(self, key: tuple[str, ...], value: Mapping[str, Any]) -> None:
+        if self._commit is None:
+            return
+        if self._get(key) is None:
+            self._workspace.put(_RESUME_NAMESPACE, key, value)
+        else:
+            self._workspace.replace(_RESUME_NAMESPACE, key, value)
+        self._commit()
+
+    def open(self, identity: Mapping[str, Any]) -> CatalogResumePoint:
+        """Bind the workspace to this build, or resume the one it already holds.
+
+        ``identity`` is everything that decides the rows: catalog id, policy
+        digest, schema digest, producer, and the inputs in the order given.
+        Order matters because staged rows carry their source index.
+        """
+
+        if self._commit is None:
+            return self.point
+        stored = self._get(("build",))
+        if stored is None:
+            self._mark(("build",), identity)
+            return self.point
+        if canonical_json_bytes(stored) != canonical_json_bytes(identity):
+            raise IntegrityError("catalog workspace was staged by a different build")
+        self.staged_state = self._get(("staged",))
+        self.cursor_state = None if self.staged_state is not None else self._get(("cursor",))
+        state = self.staged_state if self.staged_state is not None else self.cursor_state
+        self.point = CatalogResumePoint(
+            indexed=self._get(("indexed",)) is not None,
+            after=None if state is None else state["after"],
+            selected_count=0 if state is None else int(state["selectedCount"]),
+        )
+        return self.point
+
+    def input_loaded(self, source_index: int) -> bool:
+        return self._commit is not None and self._get(("input", str(source_index))) is not None
+
+    def mark_input(self, source_index: int, logical_id: str) -> None:
+        self._mark(
+            ("input", str(source_index)),
+            {"sourceIndex": source_index, "logicalId": logical_id},
+        )
+
+    def mark_indexed(self) -> None:
+        self._mark(("indexed",), {"indexed": True})
+
+    def mark_cursor(self, state: Mapping[str, Any]) -> None:
+        self._mark(("cursor",), state)
+
+    def mark_staged(self, state: Mapping[str, Any]) -> None:
+        self._mark(("staged",), state)
+
+
 class _CatalogPolicyInputs:
     """Validate each selected source once and account for the complete universe."""
 
@@ -687,8 +772,10 @@ class _CatalogPolicyInputs:
         universe_inputs: Sequence[SourceInputSelector],
         workspace: CatalogPolicyWorkspace,
         policy: SourceCatalogPolicy | None = None,
+        ledger: "_ResumeLedger | None" = None,
     ) -> None:
         self._policy = policy
+        self._ledger = ledger if ledger is not None else _ResumeLedger(workspace)
         self._sources = tuple(sources)
         self._descriptions = tuple(descriptions)
         self._universe_inputs = tuple(universe_inputs)
@@ -707,6 +794,10 @@ class _CatalogPolicyInputs:
     def descriptions(self) -> tuple[SourceNativeDescription, ...]:
         return self._descriptions
 
+    @property
+    def resume(self) -> CatalogResumePoint:
+        return self._ledger.point
+
     @staticmethod
     def _namespace(selector: SourceInputSelector) -> str:
         digest = sha256_digest(canonical_json_bytes(selector.to_dict()))
@@ -718,6 +809,13 @@ class _CatalogPolicyInputs:
         for source_index, (source, description) in enumerate(
             zip(self._sources, self._descriptions, strict=True)
         ):
+            # A resumed build does not read an input it already loaded: the
+            # ledger bound this workspace to the same inputs in the same order,
+            # so the staged rows are the bytes admission checked, read once,
+            # earlier. Keyed by position, not logical id: two inputs may share
+            # a logical id (the cross-file fixtures do) and each is its own read.
+            if self._ledger.input_loaded(source_index):
+                continue
             for record, renditions in _source_rows(source):
                 selector = SourceInputSelector(
                     description.source_system_id,
@@ -736,6 +834,7 @@ class _CatalogPolicyInputs:
                     self._workspace.put(namespace, (record["sourceRecordId"],), incoming)
                 except IntegrityError as error:
                     self._resolve_repeat(namespace, selector, incoming, error)
+            self._ledger.mark_input(source_index, description.logical_id)
         self._loaded = True
 
     def _resolve_repeat(
@@ -830,6 +929,8 @@ class _CatalogPolicyInputs:
     def _rows(
         self,
         selector: SourceInputSelector,
+        *,
+        after: str | None = None,
     ) -> Iterator[SourceNativeRow]:
         self._ensure_available(selector)
         if self._opened[selector] >= MAX_ORDERED_PASSES:
@@ -839,7 +940,9 @@ class _CatalogPolicyInputs:
         self._opened[selector] += 1
         self._load()
         previous: str | None = None
-        for value in self._workspace.iter_ordered(self._namespace(selector)):
+        for value in self._workspace.iter_ordered(
+            self._namespace(selector), after=None if after is None else (after,)
+        ):
             row = self._row(value)
             if (
                 row.description.source_system_id != selector.source_system_id
@@ -860,9 +963,18 @@ class _CatalogPolicyInputs:
         if self._universe_passes >= MAX_ORDERED_PASSES:
             raise IntegrityError("catalog policy attempted to read the universe more than twice")
         self._universe_passes += 1
+        resume = self._ledger.point
         first_pass = self._universe_passes == 1
+        # Accounting is a property of the universe, written by the first
+        # ordered pass. A resumed run's first pass starts past the cursor, and
+        # whether the rows beyond it are already accounted depends on the
+        # policy: a two-pass policy accounted the whole universe in the
+        # pre-pass it committed, a one-pass policy accounted exactly the rows
+        # it staged. So a resumed pass checks before it writes, and only a
+        # resumed pass pays that lookup.
+        resuming = resume.indexed or resume.after is not None
         streams = [
-            iter(self._rows(selector))
+            iter(self._rows(selector, after=resume.after))
             for selector in self._universe_inputs
         ]
         heap: list[tuple[bytes, int, SourceNativeRow]] = []
@@ -888,7 +1000,11 @@ class _CatalogPolicyInputs:
                 # first pass establishes it; a later ordered read must not
                 # write it again, and re-deriving the same rows is exactly what
                 # the duplicate-key refusal is for.
-                if first_pass:
+                if first_pass and not (
+                    resuming
+                    and self._workspace.get(_UNIVERSE_ACCOUNTING_NAMESPACE, (source_item_id,))
+                    is not None
+                ):
                     self._workspace.put(
                         _UNIVERSE_ACCOUNTING_NAMESPACE,
                         (source_item_id,),
@@ -931,6 +1047,7 @@ def _policy_rows(
     policy: SourceCatalogPolicy,
     policy_digest: str,
     workspace: CatalogPolicyWorkspace,
+    ledger: _ResumeLedger,
 ) -> Iterator[SourceCatalogItem]:
     inputs: CatalogPolicyInputs = _CatalogPolicyInputs(
         sources,
@@ -938,6 +1055,7 @@ def _policy_rows(
         policy.universe_inputs,
         workspace,
         policy,
+        ledger=ledger,
     )
     for item in policy.iter_items(inputs, workspace):
         for interpretation in item.interpretations:
@@ -947,11 +1065,6 @@ def _policy_rows(
                 or interpretation.get("policyDigest") != policy_digest
             ):
                 raise IntegrityError("catalog interpretation differs from the installed policy pin")
-        workspace.put(
-            _OUTPUT_ACCOUNTING_NAMESPACE,
-            (item.source_item_id,),
-            {"sourceItemId": item.source_item_id},
-        )
         yield item
     inputs.finish()
     universe = workspace.iter_ordered(_UNIVERSE_ACCOUNTING_NAMESPACE)
@@ -984,6 +1097,19 @@ class _DispositionTally:
             self.dispositions[name] += value
         for key, value in other.reasons.items():
             self.reasons[key] = self.reasons.get(key, 0) + value
+
+    def to_state(self) -> dict[str, object]:
+        return {
+            "dispositions": dict(self.dispositions),
+            "reasons": [[d, c, n] for (d, c), n in sorted(self.reasons.items())],
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> _DispositionTally:
+        tally = cls()
+        tally.dispositions = {str(k): int(v) for k, v in state["dispositions"].items()}
+        tally.reasons = {(str(d), str(c)): int(n) for d, c, n in state["reasons"]}
+        return tally
 
     def reason_counts(self) -> list[dict[str, object]]:
         """Return the receipt's ``reasonCounts`` rows in their sealed order."""
@@ -1021,17 +1147,58 @@ def _reconcile_reason_counts(rows: Sequence[Mapping[str, Any]], counts: Mapping[
 
 
 class _CatalogRowPartitioner:
-    def __init__(self, rows: Iterable[SourceCatalogItem]) -> None:
+    def __init__(
+        self,
+        rows: Iterable[SourceCatalogItem],
+        *,
+        ledger: _ResumeLedger,
+        batch_items: int,
+    ) -> None:
+        if batch_items < 1:
+            raise ValueError("resume batch size must be at least one item")
         self._rows = rows
+        self._ledger = ledger
+        self._batch_items = batch_items
         self.item_count = 0
         self.tally = _DispositionTally()
         self.disposition_counts = self.tally.dispositions
         self.selected_count = 0
         self.partition_counts: dict[str, int] = {}
+        self.last_item_id: str | None = None
+
+    def state(self) -> dict[str, Any]:
+        """Everything a resumed run restores instead of recomputing.
+
+        The producer gate re-derives all of it from the staged rows before
+        publication, so a stale or tampered state fails closed there.
+        """
+
+        return {
+            "after": self.last_item_id,
+            "itemCount": self.item_count,
+            "selectedCount": self.selected_count,
+            "partitionCounts": dict(self.partition_counts),
+            **self.tally.to_state(),
+        }
+
+    def restore(self, state: Mapping[str, Any]) -> None:
+        self.last_item_id = None if state["after"] is None else str(state["after"])
+        self.item_count = int(state["itemCount"])
+        self.selected_count = int(state["selectedCount"])
+        self.partition_counts = {str(k): int(v) for k, v in state["partitionCounts"].items()}
+        self.tally = _DispositionTally.from_state(state)
+        self.disposition_counts = self.tally.dispositions
 
     def stage(self, workspace: CatalogPolicyWorkspace) -> None:
-        previous: str | None = None
+        previous: str | None = self.last_item_id
+        started = False
         for item in self._rows:
+            if not started:
+                started = True
+                # The policy's pre-pass is complete once it yields; commit it
+                # on its own so a kill during the first batch resumes here.
+                if not self._ledger.point.indexed:
+                    self._ledger.mark_indexed()
             if previous is not None and _utf16_key(item.source_item_id) <= _utf16_key(previous):
                 raise IntegrityError("catalog policy produced duplicate or out-of-order sourceItemId values")
             previous = item.source_item_id
@@ -1060,6 +1227,16 @@ class _CatalogRowPartitioner:
                     value,
                 )
             self.partition_counts[selected_partition] = self.partition_counts.get(selected_partition, 0) + 1
+            # Accounting sits beside the payload so every commit holds both
+            # for exactly the same items; a kill can never leave them apart.
+            workspace.put(
+                _OUTPUT_ACCOUNTING_NAMESPACE,
+                (item.source_item_id,),
+                {"sourceItemId": item.source_item_id},
+            )
+            self.last_item_id = item.source_item_id
+            if self.item_count % self._batch_items == 0:
+                self._ledger.mark_cursor(self.state())
 
     @staticmethod
     def chunks(workspace: CatalogPolicyWorkspace, partition_id: str) -> Iterator[bytes]:
@@ -2020,10 +2197,12 @@ class SourceCatalogBuilder:
             [],
             AbstractContextManager[CatalogPolicyWorkspace],
         ],
+        resume_batch_items: int = 10_000,
     ) -> None:
         self._store = store
         self._policy = policy
         self._request = request
+        self._resume_batch_items = resume_batch_items
         self._workspace_factory = workspace_factory
 
     def build(self, sources: Sequence[SourceNativeRecordSource]) -> SourceCatalogBuildResult:
@@ -2043,6 +2222,19 @@ class SourceCatalogBuilder:
         catalog_schema_digest = schema_bundle_digest(_SCHEMAS)
 
         with self._workspace_factory() as workspace, self._store.stage() as staging:
+            ledger = _ResumeLedger(workspace)
+            ledger.open(
+                {
+                    "catalogId": self._request.catalog_id,
+                    "catalogSchemaDigest": catalog_schema_digest,
+                    "policyDigest": policy_digest,
+                    "producer": self._request.producer.as_dict(),
+                    "inputs": [
+                        {"logicalId": value.logical_id, "artifactDigest": value.artifact_digest}
+                        for value in descriptions
+                    ],
+                }
+            )
             row_partitioner = _CatalogRowPartitioner(
                 _policy_rows(
                     sources,
@@ -2050,9 +2242,19 @@ class SourceCatalogBuilder:
                     self._policy,
                     policy_digest,
                     workspace,
-                )
+                    ledger,
+                ),
+                ledger=ledger,
+                batch_items=self._resume_batch_items,
             )
-            row_partitioner.stage(workspace)
+            if ledger.staged_state is not None:
+                # Every row is staged and accounted; only publication remains.
+                row_partitioner.restore(ledger.staged_state)
+            else:
+                if ledger.cursor_state is not None:
+                    row_partitioner.restore(ledger.cursor_state)
+                row_partitioner.stage(workspace)
+                ledger.mark_staged(row_partitioner.state())
             partitions: list[_CatalogPartition] = []
             payload_bytes_reused = 0
             payload_bytes_written = 0
